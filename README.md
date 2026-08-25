@@ -12,7 +12,7 @@ key**, so it's trusted and bypasses RLS by design — it's meant to run
 **co-located with Postgres on the homelab, behind the Cloudflare tunnel** (PRD
 P4). No `@supabase/supabase-js`; just `fetch` (built into Node 18+) and `zod`.
 
-## The 5 tools
+## The 8 tools
 
 | Tool | Returns | What it does |
 |---|---|---|
@@ -21,9 +21,12 @@ P4). No `@supabase/supabase-js`; just `fetch` (built into Node 18+) and `zod`.
 | `get_recipe(id)` | `recipe` | The full canonical recipe object, with tags joined into a `string[]`. |
 | `list_recipes(filter?)` | `[{ id, title, tags }]` | Minimal fields only (P6). Optional `filter: { query?, tag? }` — `query` is a title substring, `tag` is an exact tag name. |
 | `add_to_meal_plan(recipe_id, date, slot)` | `{ entry_id }` | Add a recipe to the planner. `slot ∈ breakfast \| lunch \| dinner \| snack`. Calendar sync is a **server-side background job**, not done here (P2). |
+| `add_grocery_item(name, quantity?, unit?)` | `{ id, name, category }` | Add one item to the grocery list, auto-sorted into a store aisle by name. |
+| `add_recipe_to_grocery(recipe_id)` | `{ added }` | Add all of a recipe's ingredients to the grocery list, each aisle-sorted. |
+| `list_grocery(filter?)` | `{ count, items }` | List grocery items with their aisle category. Optional `filter: { unchecked_only? }`. |
 
-The recipe shape is the canonical Recipe JSON from
-[`docs/CONTRACT.md`](../docs/CONTRACT.md) **minus** the server-assigned fields
+The recipe shape is the canonical Recipe JSON from the main Sauce repo's
+`docs/CONTRACT.md` **minus** the server-assigned fields
 (`id`, `image`, `created_at`, `updated_at`, `updated_by`). Ingredients and steps
 are structured, never free text — that's what enables scaling, grocery
 generation, and step→ingredient tap-through.
@@ -41,13 +44,34 @@ Copy `.env.example` to `.env` and fill in the homelab Supabase URL and the
 ```
 SUPABASE_URL=https://sauce.<homelab-tunnel>
 SUPABASE_SERVICE_KEY=...
+SAUCE_OWNER_ID=<auth.users id>   # stamped on MCP-created rows so RLS-scoped clients see them
 ```
+
+Optional extras (see `.env.example`): `UNSPLASH_ACCESS_KEY` for auto-images,
+`SAUCE_PUBLIC_BASE` for the base baked into stored image URLs, and the
+`APNS_*` keys for the "new recipe" push.
 
 Run it standalone for a smoke test:
 
 ```bash
 SUPABASE_URL=... SUPABASE_SERVICE_KEY=... npm start
 ```
+
+## Hosted HTTP (cloud connector)
+
+There's a second entrypoint, `dist/http.js` (Streamable HTTP transport +
+Express), for running it as a hosted custom connector — same tools, reachable
+by URL from Claude web/desktop/CLI:
+
+```bash
+PORT=8788 SAUCE_MCP_TOKEN=<long-random-secret> npm run start:http
+curl localhost:8788/health   # → { ok: true, ... }
+```
+
+Auth is a shared secret in `SAUCE_MCP_TOKEN`, accepted as
+`Authorization: Bearer <token>`, `x-api-key: <token>`, or `?key=<token>` in the
+connector URL. If it's unset the endpoint is **unauthenticated** (it warns on
+boot). The `Dockerfile` serves this entrypoint on `:8788`.
 
 ## Configure in Claude Code / Desktop
 
@@ -56,7 +80,7 @@ SUPABASE_URL=... SUPABASE_SERVICE_KEY=... npm start
 ```bash
 claude mcp add sauce-recipe -- \
   env SUPABASE_URL=https://sauce.<homelab-tunnel> SUPABASE_SERVICE_KEY=<service-key> \
-  node /Users/ravemac/dev/sauce/recipe-mcp/dist/index.js
+  node /path/to/sauce-mcp/dist/index.js
 ```
 
 ### Raw JSON config
@@ -69,7 +93,7 @@ For Claude Desktop (`claude_desktop_config.json`) or a project
   "mcpServers": {
     "sauce-recipe": {
       "command": "node",
-      "args": ["/Users/ravemac/dev/sauce/recipe-mcp/dist/index.js"],
+      "args": ["/path/to/sauce-mcp/dist/index.js"],
       "env": {
         "SUPABASE_URL": "https://sauce.<homelab-tunnel>",
         "SUPABASE_SERVICE_KEY": "<service-key>"
@@ -83,7 +107,8 @@ For Claude Desktop (`claude_desktop_config.json`) or a project
 
 - `npm run build` — compile with `tsc` to `dist/`.
 - `npm run dev` — `tsx watch` for local iteration.
-- `npm start` — run the built server (`node dist/index.js`).
+- `npm start` — run the built stdio server (`node dist/index.js`).
+- `npm run start:http` — run the hosted HTTP server (`node dist/http.js`).
 
 ## Design notes (PRD principles)
 
@@ -92,7 +117,9 @@ For Claude Desktop (`claude_desktop_config.json`) or a project
   the id is in hand, so it never delays the perceived latency.
 - **P6 — minimal payloads.** Confirmation tools return tiny objects
   (`{id}`, `{id,title}`, `{entry_id}`), never the echoed full recipe.
-- **P2 — side effects are server-side.** Image fetch from `source_url` and
-  calendar sync for meal-plan entries are background jobs, not done in-tool.
+- **P2 — side effects are server-side.** Auto-image (Unsplash, Wikipedia
+  fallback — close-or-nothing) and the APNs "new recipe" push run
+  fire-and-forget after `create_recipe` returns; calendar sync for meal-plan
+  entries is a background job, not done in-tool.
 - **P4 — trusted & co-located.** Uses the service key and bypasses RLS by
   design; it lives next to Postgres behind the Cloudflare tunnel.
